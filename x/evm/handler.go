@@ -1,13 +1,12 @@
 package evm
 
 import (
-	"fmt"
 	"math/big"
 
 	"github.com/ethereum/go-ethereum/common"
 
 	sdk "github.com/cosmos/cosmos-sdk/types"
-	authutils "github.com/cosmos/cosmos-sdk/x/auth/client/utils"
+	sdkerrors "github.com/cosmos/cosmos-sdk/types/errors"
 	emint "github.com/cosmos/ethermint/types"
 	"github.com/cosmos/ethermint/x/evm/types"
 
@@ -17,25 +16,26 @@ import (
 // NewHandler returns a handler for Ethermint type messages.
 func NewHandler(k Keeper) sdk.Handler {
 	return func(ctx sdk.Context, msg sdk.Msg) sdk.Result {
+		ctx = ctx.WithEventManager(sdk.NewEventManager())
 		switch msg := msg.(type) {
 		case types.MsgEthereumTx:
 			return HandleMsgEthereumTx(ctx, k, msg)
 		case types.MsgEthermint:
 			return HandleMsgEthermint(ctx, k, msg)
 		default:
-			errMsg := fmt.Sprintf("unrecognized ethermint msg type: %v", msg.Type())
-			return sdk.ErrUnknownRequest(errMsg).Result()
+			return sdk.ResultFromError(
+				sdkerrors.Wrapf(sdkerrors.ErrUnknownRequest, "unrecognized %s message type: %T", ModuleName, msg),
+			)
 		}
 	}
 }
 
 // HandleMsgEthereumTx handles an Ethereum specific tx
 func HandleMsgEthereumTx(ctx sdk.Context, k Keeper, msg types.MsgEthereumTx) sdk.Result {
-	ctx = ctx.WithEventManager(sdk.NewEventManager())
 	// parse the chainID from a string to a base-10 integer
 	intChainID, ok := new(big.Int).SetString(ctx.ChainID(), 10)
 	if !ok {
-		return emint.ErrInvalidChainID(fmt.Sprintf("invalid chainID: %s", ctx.ChainID())).Result()
+		return sdk.ResultFromError(sdkerrors.Wrap(emint.ErrInvalidChainID, ctx.ChainID()))
 	}
 
 	// Verify signature and retrieve sender address
@@ -44,13 +44,7 @@ func HandleMsgEthereumTx(ctx sdk.Context, k Keeper, msg types.MsgEthereumTx) sdk
 		return sdk.ResultFromError(err)
 	}
 
-	// Encode transaction by default Tx encoder
-	txEncoder := authutils.GetTxEncoder(types.ModuleCdc)
-	txBytes, err := txEncoder(msg)
-	if err != nil {
-		return sdk.ResultFromError(err)
-	}
-	txHash := tmtypes.Tx(txBytes).Hash()
+	txHash := tmtypes.Tx(ctx.TxBytes()).Hash()
 	ethHash := common.BytesToHash(txHash)
 
 	st := types.StateTransition{
@@ -66,7 +60,9 @@ func HandleMsgEthereumTx(ctx sdk.Context, k Keeper, msg types.MsgEthereumTx) sdk
 		THash:        &ethHash,
 		Simulate:     ctx.IsCheckTx(),
 	}
+
 	// Prepare db for logs
+	// TODO: block hash
 	k.CommitStateDB.Prepare(ethHash, common.Hash{}, k.TxCount)
 	k.TxCount++
 
@@ -80,7 +76,7 @@ func HandleMsgEthereumTx(ctx sdk.Context, k Keeper, msg types.MsgEthereumTx) sdk
 	k.Bloom.Or(k.Bloom, returnData.Bloom)
 
 	// update transaction logs in KVStore
-	err = k.SetTransactionLogs(ctx, returnData.Logs, txHash)
+	err = k.SetTransactionLogs(ctx, returnData.Logs, txHash[:])
 	if err != nil {
 		return sdk.ResultFromError(err)
 	}
@@ -113,12 +109,14 @@ func HandleMsgEthereumTx(ctx sdk.Context, k Keeper, msg types.MsgEthereumTx) sdk
 
 // HandleMsgEthermint handles a MsgEthermint
 func HandleMsgEthermint(ctx sdk.Context, k Keeper, msg types.MsgEthermint) sdk.Result {
-	ctx = ctx.WithEventManager(sdk.NewEventManager())
 	// parse the chainID from a string to a base-10 integer
 	intChainID, ok := new(big.Int).SetString(ctx.ChainID(), 10)
 	if !ok {
-		return emint.ErrInvalidChainID(fmt.Sprintf("invalid chainID: %s", ctx.ChainID())).Result()
+		return sdk.ResultFromError(sdkerrors.Wrap(emint.ErrInvalidChainID, ctx.ChainID()))
 	}
+
+	txHash := tmtypes.Tx(ctx.TxBytes()).Hash()
+	ethHash := common.BytesToHash(txHash)
 
 	st := types.StateTransition{
 		Sender:       common.BytesToAddress(msg.From.Bytes()),
@@ -129,6 +127,7 @@ func HandleMsgEthermint(ctx sdk.Context, k Keeper, msg types.MsgEthermint) sdk.R
 		Payload:      msg.Payload,
 		Csdb:         k.CommitStateDB.WithContext(ctx),
 		ChainID:      intChainID,
+		THash:        &ethHash,
 		Simulate:     ctx.IsCheckTx(),
 	}
 
@@ -138,7 +137,7 @@ func HandleMsgEthermint(ctx sdk.Context, k Keeper, msg types.MsgEthermint) sdk.R
 	}
 
 	// Prepare db for logs
-	k.CommitStateDB.Prepare(common.Hash{}, common.Hash{}, k.TxCount) // Cannot provide tx hash
+	k.CommitStateDB.Prepare(ethHash, common.Hash{}, k.TxCount)
 	k.TxCount++
 
 	returnData, err := st.TransitionCSDB(ctx)
